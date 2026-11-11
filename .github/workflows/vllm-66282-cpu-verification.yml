@@ -1,0 +1,127 @@
+name: vLLM PR 66282 CPU regression check
+
+on:
+  push:
+    branches:
+      - codex/validate-vllm-66282-cpu
+
+permissions: {}
+
+jobs:
+  cpu-before-and-after:
+    if: ${{ github.repository == 'peterzhang987723/vllm' && github.event.repository.private == false }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CPU_IMAGE: public.ecr.aws/q9t5s3a7/vllm-ci-postmerge-repo@sha256:8b265f13b82cb7a8bf0c9374507d3cbc43b86ec368151a75ea05afddd5d0f778
+      PR_HEAD: 797dc47aabcc3e68a0143a4fcbd9c0916172bdf5
+      PATCH_SHA256: 3195ff176f808e28525464149eef612dc3f3dde3b5cc827130d4a45042b297ce
+      CONFTEST_SHA256: e6aeab62f766548ca6d2fc34e8531566fbc49ab1534d402421fee3511a481c27
+    steps:
+      - name: Prepare original and patched test inputs
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/vllm-66282-cpu"
+          mkdir -p "$work/before" "$work/after"
+          git init -q "$work/source"
+          git -C "$work/source" fetch --depth=1 --no-tags \
+            https://github.com/peterzhang987723/vllm.git "$PR_HEAD"
+          git -C "$work/source" checkout --quiet --detach FETCH_HEAD
+          test "$(git -C "$work/source" rev-parse HEAD)" = "$PR_HEAD"
+          printf '%s  %s\n' "$CONFTEST_SHA256" "$work/source/tests/conftest.py" | sha256sum -c -
+
+          curl --fail --silent --show-error --max-time 30 \
+            "https://raw.githubusercontent.com/peterzhang987723/vllm/$GITHUB_SHA/validation/vllm-66282-rocm-routing.patch" \
+            --output "$work/routing.patch"
+          printf '%s  %s\n' "$PATCH_SHA256" "$work/routing.patch" | sha256sum -c -
+
+          stage_inputs() {
+            cp "$work/source/vllm/models/deepseek_v4/nvidia/mtp.py" "$1/nvidia-mtp.py"
+            cp "$work/source/vllm/models/deepseek_v4/xpu/mtp.py" "$1/xpu-mtp.py"
+            cp "$work/source/tests/models/test_dspark_mla.py" "$1/test_dspark_mla.py"
+          }
+          stage_inputs "$work/before"
+          git -C "$work/source" apply --check "$work/routing.patch"
+          git -C "$work/source" apply "$work/routing.patch"
+          git -C "$work/source" diff --check
+          stage_inputs "$work/after"
+
+      - name: Pull the pinned official Linux CPU test image
+        timeout-minutes: 13
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          docker_root=$(docker info --format '{{.DockerRootDir}}')
+          available=$(df -PB1 "$docker_root" | awk 'END {print $4}')
+          echo "Available Docker disk bytes before pull: $available"
+          if (( available < 12000000000 )); then
+            echo "The official test image requires at least 12 GB of free space for this check."
+            exit 1
+          fi
+          timeout --kill-after=15s 12m docker pull --platform=linux/amd64 "$CPU_IMAGE"
+          docker image inspect --format '{{.Os}}/{{.Architecture}} {{.Size}} bytes' "$CPU_IMAGE"
+          available=$(df -PB1 "$docker_root" | awk 'END {print $4}')
+          echo "Available Docker disk bytes after pull: $available"
+          test "$available" -ge 1000000000
+
+      - name: Compare the standard CPU pytest runs
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/vllm-66282-cpu"
+          run_variant() {
+            local variant=$1
+            timeout --kill-after=15s 6m docker run --rm -i --network=none \
+              --platform=linux/amd64 --ulimit core=0 \
+              --mount "type=bind,src=$work/$variant,dst=/candidate,readonly" \
+              "$CPU_IMAGE" /bin/bash -s -- "$variant" "$CONFTEST_SHA256" <<'CONTAINER'
+          set -euo pipefail
+          variant=$1
+          conftest_sha=$2
+          python=/opt/venv/bin/python
+          test -x "$python"
+          package=$("$python" -c 'import importlib.util; print(importlib.util.find_spec("vllm").submodule_search_locations[0])')
+          case "$package" in
+            /opt/venv/lib/python*/site-packages/vllm) ;;
+            *) echo "Unexpected installed vLLM package location: $package"; exit 1 ;;
+          esac
+          cd /vllm-workspace/tests
+          printf '%s  conftest.py\n' "$conftest_sha" | sha256sum -c -
+          cp /candidate/nvidia-mtp.py "$package/models/deepseek_v4/nvidia/mtp.py"
+          cp /candidate/xpu-mtp.py "$package/models/deepseek_v4/xpu/mtp.py"
+          cp /candidate/test_dspark_mla.py models/test_dspark_mla.py
+          "$python" -c 'from vllm.platforms import current_platform; assert current_platform.is_cpu()'
+          "$python" -m pytest -v -s models/test_dspark_mla.py --junitxml=/tmp/vllm-66282.xml
+
+          if [[ "$variant" == after ]]; then
+            "$python" - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          prefix = "test_deepseek_v4_mtp_packed_modules_mapping_and_quant_alignment"
+          expected = {f"{prefix}[v4_nvidia_mtp]", f"{prefix}[v4_xpu_mtp]"}
+          cases = {
+              node.attrib["name"]: node
+              for node in ET.parse("/tmp/vllm-66282.xml").iter("testcase")
+              if node.attrib["name"].startswith(prefix)
+          }
+          assert set(cases) == expected, sorted(cases)
+          for name, node in cases.items():
+              assert not any(child.tag in {"skipped", "failure", "error"} for child in node), name
+          print("Both expected MTP entry-point cases passed on CPU.")
+          PY
+          fi
+          CONTAINER
+          }
+
+          before_status=0
+          run_variant before 2>&1 | tee "$work/before.log" || before_status=${PIPESTATUS[0]}
+          after_status=0
+          run_variant after 2>&1 | tee "$work/after.log" || after_status=${PIPESTATUS[0]}
+          printf 'Original exit status: %s\nPatched exit status: %s\n' "$before_status" "$after_status"
+          test "$before_status" -ne 0
+          grep -F 'Only a single TORCH_LIBRARY can be used to register the namespace _C' "$work/before.log"
+          test "$after_status" -eq 0
